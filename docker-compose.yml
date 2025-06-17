@@ -1,0 +1,30 @@
+services:
+  server:
+    build: ./server
+    ports:
+      - "12345:12345"
+    command: python chat_server.py 0.0.0.0 12345
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./server/src:/app
+
+  client1:
+    build: ./client
+    command: python chat_client.py server 12345
+    stdin_open: true
+    tty: true
+    depends_on:
+      - server
+    volumes:
+      - ./client/src:/app
+
+  client2:
+    build: ./client
+    command: python chat_client.py server 12345
+    stdin_open: true
+    tty: true
+    depends_on:
+      - server
+    volumes:
+      - ./client/src:/app
