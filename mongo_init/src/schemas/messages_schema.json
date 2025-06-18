@@ -1,0 +1,38 @@
+{
+  "$jsonSchema": {
+    "bsonType": "object",
+    "required": ["sessionId", "sender", "receivers", "content", "timestamp"],
+    "properties": {
+      "sessionId": {
+        "bsonType": "objectId",
+        "description": "must be an ObjectId referencing the chat session and is required"
+      },
+      "sender": {
+        "bsonType": {
+          "description": "must be a string (username) and is required",
+          "minLength": 1
+        }
+      },
+      "receivers": {
+        "bsonType": "array",
+        "description": "must be an array of receiver usernames and is required",
+        "minItems": 1,
+        "items": {
+          "bsonType": "string",
+          "minLength": 1
+        },
+        "uniqueItems": true
+      },
+      "content": {
+        "bsonType": "string",
+        "description": "must be a string and is required",
+        "minLength": 1
+      },
+      "timestamp": {
+        "bsonType": "date",
+        "description": "must be a date and is required"
+      }
+    },
+    "additionalProperties": false
+  }
+}

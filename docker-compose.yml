@@ -1,4 +1,29 @@
 services:
+  mongo:
+    image: mongo:latest
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_INITDB_ROOT_USERNAME}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_INITDB_ROOT_PASSWORD}
+    restart: unless-stopped
+
+  mongo_init:
+    build: ./mongo_init
+    command: python mongo_init.py
+    depends_on:
+      - mongo
+    environment:
+      - MONGO_HOST=mongo
+      - MONGO_PORT=27017
+      - MONGO_ROOT_USERNAME=${MONGO_INITDB_ROOT_USERNAME}
+      - MONGO_ROOT_PASSWORD=${MONGO_INITDB_ROOT_PASSWORD}
+      - MONGO_APP_USERNAME=${MONGO_APP_USERNAME}
+      - MONGO_APP_PASSWORD
+      - MONGO_DB_NAME=${MONGO_DB_NAME}
+
   server:
     build: ./server
     ports:
@@ -8,6 +33,14 @@ services:
     tty: true
     volumes:
       - ./server/src:/app
+    depends_on:
+      - mongo_init
+    environment:
+      - MONGO_USERNAME=${MONGO_APP_USERNAME}
+      - MONGO_PASSWORD=${MONGO_APP_PASSWORD}
+      - MONGO_HOST=mongo
+      - MONGO_PORT=27017
+      - MONGO_DB_NAME=${MONGO_DB_NAME}
 
   client1:
     build: ./client
@@ -28,3 +61,5 @@ services:
       - server
     volumes:
       - ./client/src:/app
+volumes:
+  mongo_data:

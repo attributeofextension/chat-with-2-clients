@@ -2,60 +2,92 @@ import socket
 import threading
 import json
 import sys
+import os
+from pymongo import MongoClient
+from datetime import datetime, UTC
+import queue
+from bson.objectid import ObjectId
+import bcrypt
+import time
 
+MONGO_HOST = os.getenv("MONGO_HOST", "mongo")
+MONGO_PORT = int(os.getenv("MONGO_PORT", "27017"))
+MONGO_USERNAME = os.getenv("MONGO_USERNAME")
+MONGO_PASSWORD = os.getenv("MONGO_PASSWORD")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", 'chat_app_db')
 
-class ChatSession(threading.Thread):
-    def __init__(self, client1_conn, client1_addr, client2_conn, client2_addr):
-        super().__init__()
-        self.client1_conn = client1_conn
-        self.client1_addr = client1_addr
-        self.client2_conn = client2_conn
-        self.client2_addr = client2_addr
-        self.session_active = True
-        print(f"New chat session started between {client1_addr} and {client2_addr}")
+mongo_client = None
+db = None
+users_collection = None
+sessions_collection = None
+messages_collection = None
 
-        send_message(self.client1_conn, "info", f"Connected to chat. You are chatting with {client2_addr}.")
-        send_message(self.client2_conn, "info", f"Connected to chat. You are chatting with {client1_addr}.")
+def init_mongodb():
+    global mongo_client, db, users_collection, sessions_collection, messages_collection
+    try:
+        if MONGO_USERNAME and MONGO_PASSWORD:
+            mongo_client = MongoClient(MONGO_HOST, MONGO_PORT, username=MONGO_USERNAME, password=MONGO_PASSWORD, authSource=MONGO_DB_NAME)
+        else:
+            mongo_client = MongoClient(MONGO_HOST, MONGO_PORT)
 
-    def relay_messages(self, sender_conn, receiver_conn, sender_addr, receiver_addr):
-        while self.session_active:
-            message = receive_message(sender_conn)
-            if message is None:
-                print(f"Client {sender_addr} disconnected. Ending chat session for {self.client1_addr} and {self.client2_addr}.")
-                send_message(receiver_conn, "info", f"Your chat partner ({sender_addr}) has disconnected. Chat session ended.")
-                self.session_active = False
-                break
+        mongo_client.admin.command('ping')
+        print(f"Successfully connected to MongoDB at {MONGO_HOST}:{MONGO_PORT} as user '{MONGO_USERNAME}'.")
 
-            if message.get("type") == "chat":
-                print(f"[{sender_addr}]: {message.get('content')}")
-                if not send_message(receiver_conn, "chat", f"[{sender_addr[1]}]: {message.get('content')}"):
-                    print(f"Failed to relay message to {receiver_addr}. Ending chat session.")
-                    self.session_active = False
-                    break
-            else:
-                print(f"WARNING: Unknown message type: '{message.get('type')}' from {sender_addr}.")
+        db = mongo_client[MONGO_DB_NAME]
+        users_collection = db['users']
+        sessions_collection = db['sessions']
+        messages_collection = db['messages']
 
-        sender_conn.close()
-    def run(self):
-        thread1 = threading.Thread(target=self.relay_messages, args=(self.client1_conn, self.client2_conn, self.client1_addr, self.client2_addr))
-        thread2 = threading.Thread(target=self.relay_messages, args=(self.client2_conn, self.client1_conn, self.client2_addr, self.client1_addr))
+        print(f"Using database: {MONGO_DB_NAME}")
+        print("Collections: users, sessions, messages are ready.")
 
-        thread1.start()
-        thread2.start()
+        return True
+    except Exception as e:
+        print(f"ERROR: Failed to connect to MongoDB or access collections: {e}")
+        return False
 
-        thread1.join()
-        thread2.join()
+def register_user(username, password):
+    if not username or not password:
+        return False, "Username and password cannot be empty."
 
-        try:
-            self.client1_conn.close()
-        except socket.error:
-            pass
-        try:
-            self.client2_conn.close()
-        except socket.error:
-            pass
+    hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    try:
+        users_collection.insert_one({
+            "username": username,
+            "password_hash": hashed_password,
+            "created_at": datetime.now(UTC)
+        })
+        print(f"User '{username}' registered successfully.")
+        return True, "Registration successful."
+    except Exception as e:
+        if "duplicate key error" in str(e):
+            return False, "Username already exists."
+        print(f"ERROR: Failed to register user '{username}': {e}")
+        return False, "Registration failed due to a server error."
 
-        print(f"Chat session between {self.client1_addr} and {self.client2_addr} ended.")
+def authenticate_user(username, password):
+    user = users_collection.find_one({"username": username})
+    if user and bcrypt.checkpw(password.encode('utf-8'), user["password_hash"].encode('utf-8')):
+        print(f"User '{username}' authenticated successfully.")
+        return True, user
+    print(f"Authentication failed for user '{username}'.")
+    return False, None
+
+def store_message(session_id, sender_username, receiver_usernames, content):
+    try:
+        messages_collection.insert_one({
+            "sessionId": session_id,
+            "sender": sender_username,
+            "receiver": receiver_usernames,
+            "content": content,
+            "timestamp": datetime.now(UTC)
+        })
+        print(f"Message from '{sender_username}' to [{', '.join(receiver_usernames)}] stored.")
+        return True
+    except Exception as e:
+        print(f"ERROR: Failed to store message: {e}")
+        return False
+
 
 def send_message(conn, message_type, content):
     msg_dict = {"type": message_type, "content": content}
@@ -102,49 +134,328 @@ def receive_message(conn):
             print(f"ERROR: Unexpected error during receive from {conn.getpeername() if conn.getpeername() else 'unknown'}: {e}")
             return None
 
+authenticated_client_queue = queue.Queue()
+
+class AuthenticationHandler(threading.Thread):
+    def __init__(self, conn, addr):
+        super().__init__()
+        self.conn = conn
+        self.addr = addr
+        print(f"Authentication handler started for {self.addr}")
+
+    def run(self):
+        try:
+            if not send_message(self.conn, "auth_prompt", "Please authenticate. {'type': 'auth_request', 'action': 'login'/'register', 'username': '...', 'password': '...')"):
+                print(f"Client {self.addr} disconnected before auth prompt sent.")
+                self.conn.close()
+                return
+
+            auth_message = receive_message(self.conn)
+            if auth_message is None:
+                print(f"Client {self.addr} disconnected before authentication response.")
+                self.conn.close()
+                return
+
+            if auth_message.get("type") == "auth_request":
+                action = auth_message.get("action")
+                username = auth_message.get("username")
+                password = auth_message.get("password")
+
+                if action == "register":
+                    success, msg = register_user(username, password)
+                    if success:
+                        auth_success, user_doc = authenticate_user(username, password)
+                        if auth_success:
+                            send_message(self.conn, "auth_response", f"Registration successful and logged in as {username}.")
+                            print(f"Client {self.addr} registered and logged in as {username}")
+                            authenticated_client_queue.put((self.conn, self.addr, username))
+                        else:
+                            send_message(self.conn, "auth_response", "Registration successful, but failed to auto-login. Please try logging in.")
+                            self.conn.close()
+                    else:
+                        send_message(self.conn, "auth_reponse", msg)
+                        print(f"Client {self.addr} registration failed: {msg}")
+                        self.conn.close()
+                elif action == "login":
+                    auth_success, user_doc = authenticate_user(username, password)
+                    if auth_success:
+                        send_message(self.conn, "auth_response", f"Login successful as {username}.")
+                        print(f"Client {self.addr} logged in as {username}.")
+                        authenticated_client_queue.put(ChatClient(username, self.conn, self.addr))
+                    else:
+                        send_message(self.conn, "auth_response", "Login failed: Invalid username or password.")
+                        print(f"Client {self.addr} login failed.")
+                        self.conn.close()
+                else:
+                    send_message(self.conn, "auth_response", "Invalid authentication action.")
+                    print(f"Client {self.addr} sent invalid message type for auth: {auth_message.get('type')}")
+                    self.conn.close()
+            else:
+                send_message(self.conn, "auth_response", "Invalid authentication message type.")
+                print(f"Client {self.addr} sent invalid message type for auth: {auth_message.get('type')}")
+                self.conn.close()
+        except Exception as e:
+            print(f"ERROR: Exception in AuthenticationHandler for {self.addr}: {e}")
+            try:
+                self.conn.close()
+            except socket.error:
+                pass
+
+class ChatClient:
+    def __init__(self, username, conn, addr):
+        self.username = username
+        self.conn = conn
+        self.addr = addr
+
+    def __str__(self):
+        return f"User {self.username} on {self.addr}"
+
+class ChatMessage:
+    def __init__(self, message_type, content):
+        self.message_type = message_type
+        self.content = content
+
+class BroadcastMessage(ChatMessage):
+    def __init__(self, message_type, content, chat_session, exclude_sender=False, sender=None):
+        super().__init__(message_type, content)
+        self.sender = sender
+        self.chat_session = chat_session
+        self.exclude_sender = exclude_sender
+        self.sender = sender
+
+class ChatSession(threading.Thread):
+    def __init__(self, clients):
+        super().__init__()
+        self.session_id = ObjectId()
+        self.active_clients_index = {client.username: client for client in clients}
+        self.session_lock = threading.Lock()
+        self.broadcast_queue = queue.Queue()
+        self.session_active = True
+
+        self.participants = sorted(client.username for client in clients)
+
+        print(f"New chat session ({self.session_id}) initiated with participants: {self.participants}")
+
+        self.create_db_session()
+
+        for username, client in self.active_clients_index.items():
+            send_message(client.conn, "info", f"Welcome to the group chat! Your session ID is {self.session_id}")
+            send_message(client.conn, "info", f"Participants: {', '.join(self.participants)}")
+
+    def create_db_session(self):
+        try:
+            result = sessions_collection.insert_one({
+                "participants": self. participants,
+                "start_time": datetime.now(UTC),
+                "status": "active"
+            })
+            self.session_id = result.inserted_id
+            print(f"MongoDB session created with ID: {self.session_id}")
+        except Exception as e:
+            print(f"ERROR: Failed to create MongoDB session: {e}")
+            self.session_id = None
+
+    def update_db_session_status(self, status):
+        if self.session_id:
+            try:
+                sessions_collection.update_one(
+                    {"_id": self.session_id },
+                    {"$set": {"status": status, "end_time": datetime.now(UTC) if status == "ended" else None}}
+                )
+                print(f"MongoDB session {self.session_id} updated to {status}.")
+            except Exception as e:
+                print(f"ERROR: Failed to update MongoDB session {self.session_id} status: {e}")
+
+
+    def get_receivers_for_sender(self, sender):
+        receivers = []
+        for user in self.users:
+            if user.username == sender.username:
+                continue
+            receivers.append(user)
+        return receivers
+
+    def broadcast_message(self, message_type, content, exclude_sender=False, sender=None):
+        failed_to_send = []
+        with self.session_lock:
+
+            for user in self.users:
+                if exclude_sender and sender is not None and user.username != sender.username:
+                    continue
+                if not send_message(user.conn, "chat", content):
+                    print(f"Failed to broadcast message to client {user.conn.getpeername()}.")
+                    failed_to_send.append(user)
+
+    def _client_listener_thread(self, client_conn, client_addr, username):
+        print(f"Client listener thread started for {username} ({client_addr}) in session {self.session_id}")
+        while self.session_active:
+            message = receive_message(client_conn)
+            if message is None:
+                print(f"Client {username} ({client_addr}) disconnected from session {self.session_id}.")
+                with self.session_lock:
+                    if username in self.active_clients_index:
+                        del self.active_clients_index[username]
+                        print(f"Removed {username} from active clients. Remaining: {list(self.active_clients_index.keys())}")
+                    if not self.active_clients_index and self.session_active:
+                        self.session_active = False
+                        print(f"No active clients left in session {self.session_id}. Singalling session end.")
+                self.broadcast_queue.put({'type': 'info', 'sender': 'SERVER', 'content': f"{username} has left the chat."})
+                break
+            if message.get("type") == "chat":
+                content = message.get("content")
+                self.broadcast_queue.put({"type": "chat", "sender": username, "content": content})
+            elif message.get("type") == "auth_request":
+                print(f"WARNING: Unexpected auth_request from {username} ({client_addr}) during active session.")
+            else:
+                print(f"WARNING: Unknown message type '{message.get('type')}' from {username} ({client_addr})")
+
+        try:
+            client_conn.close()
+        except socket.error:
+            pass
+
+    def _broadcast_thread_handler(self):
+        print(f"Broadcast thread started for session {self.session_id}")
+        while self.session_active or not self.broadcast_queue.empty():
+            try:
+                msg_to_broadcast = self.broadcast_queue.get(timeout=1)
+
+                msg_type = msg_to_broadcast.get('type')
+                sender = msg_to_broadcast.get('sender')
+                content = msg_to_broadcast.get('content')
+
+                formatted_message = f"[{sender}]: {content}" if msg_type == 'chat' else content
+
+                if self.session_id and msg_type == 'chat':
+                    with self.session_lock:
+                        current_participants_usernames = list(self.active_clients_index.keys())
+
+                    receivers_for_db = [p for p in current_participants_usernames if p != sender]
+                    store_message(self.session_id, sender, receivers_for_db, content)
+                elif msg_type == 'chat':
+                    print(f"Not storing non-chat message type '{msg_type}' from broadcast queue.")
+
+                with self.session_lock:
+                    current_clients = list(self.active_clients_index.values())
+
+                for client in current_clients:
+                    conn = client.conn
+                    client_username = client.username
+
+                    if msg_type == 'chat' and client_username == sender:
+                        continue
+
+                    if not send_message(conn, msg_type, formatted_message):
+                        print(f"Failed to send broadcast to {client_username}. Assuming disconnected.")
+
+            except queue.Empty:
+                pass
+            except Exception as e:
+                print(f"ERROR: Exception in broadcast thread for session {self.session_id}: {e}")
+        print(f"Broadcast thread for session {self.session_id} ended.")
+
+    def run(self):
+        broadcast_thread = threading.Thread(target=self._broadcast_thread_handler, daemon=True)
+        broadcast_thread.start()
+
+        client_listener_threads = []
+        initial_client_items = None
+        with self.session_lock:
+            initial_client_items = list(self.active_clients_index.items())
+
+        for username, client in initial_client_items:
+            conn = client.conn
+            addr = client.addr
+            thread = threading.Thread(target=self._client_listener_thread, args=(conn, addr, username), daemon=True)
+            client_listener_threads.append(thread)
+            thread.start()
+
+        while self.session_active:
+            time.sleep(0.5)
+
+        print(f"Session {self.session_id} main thread detected session inactive. Joining listener threads...")
+        for thread in client_listener_threads:
+            if thread.is_alive():
+                thread.join(timeout=1)
+
+        if broadcast_thread.is_alive():
+            broadcast_thread.join(timeout=2)
+
+        self.update_db_session_status("ended")
+
+        print(f"Chat session {self.session_id} fully terminated.")
+
+
+
+
 def start_server(host, port):
+    if not init_mongodb():
+        print("Server cannot start without MongoDB connection. Exiting.")
+        sys.exit(1)
+
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.settimeout(1.0)
 
     try:
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_socket.bind((host, port))
         server_socket.listen(5)
         print(f"Chat Server listening on {host}:{port}")
-        print("Waiting for clients to connect...")
-
-        pending_client = None
+        print("Waiting for clients to connect and authenticate...")
 
         while True:
             try:
                 conn, addr = server_socket.accept()
-                print(f"Client connected: {addr}")
+                print(f"New connection from {addr}. Spawning authentication handler.")
 
-                if pending_client is None:
-                    pending_client = (conn, addr)
-                    send_message(conn, "info", "Waiting for another user to join the chat...")
-                    print(f"Client {addr} is waiting for a partner.")
-                else:
-                    client1_conn, client1_addr = pending_client
-                    client2_conn, client2_addr = conn, addr
+                auth_handler = AuthenticationHandler(conn, addr)
+                auth_handler.start()
 
-                    chat_session = ChatSession(client1_conn, client1_addr, client2_conn, client2_addr)
-                    chat_session.start()
-                    pending_client = None
-                    print(f"Paired {client1_addr} to {client2_addr}. New chat session started.")
+                while authenticated_client_queue.qsize() >= 3:
+                    client1 = authenticated_client_queue.get()
+                    client2 = authenticated_client_queue.get()
+                    client3 = authenticated_client_queue.get()
+
+                    # test sockets before spawning chat session
+                    try:
+                        client1.conn.send(b'', 0)
+                        client2.conn.send(b'', 0)
+                        client3.conn.send(b'', 0)
+
+                        chat_session = ChatSession([client1, client2, client3])
+                        chat_session.start()
+                        print(f"Grouped [{', '.join([client1,client2,client3])}]. New chat session started.")
+                    except socket.error as se:
+                        print(f"WARNING: One or more clients ([{', '.join([client1, client2, client3])}]) disconnected before chat session could start: {se}. Discarding group.")
+                        try: client1.conn.close()
+                        except: pass
+                        try: client2.conn.close()
+                        except: pass
+                        try: client3.conn.close()
+                        except: pass
 
             except socket.timeout:
-                continue
+                if authenticated_client_queue.qsize() >= 3:
+                    continue
+                else:
+                    continue
+            except socket.error as e:
+                print(f"ERROR: Socket error during server accept loop: {e}")
+                break
             except KeyboardInterrupt:
                 print("\nServer shutting down.")
                 break
             except Exception as e:
-                print(f"An unexpected error occurred in server: {e}")
+                print(f"An unexpected general error occurred in server: {e}")
                 break
-    except socket.error as error:
-        print(f"Socket error: {error}")
+    except socket.error as e:
+        print(f"Failed to start server (bind/listen): {e}")
     finally:
         server_socket.close()
-        print("Server socket closed")
+        print("Server socket closed.")
+        if mongo_client:
+            mongo_client.close()
+            print("MongoDB connection closed.")
 
 
 

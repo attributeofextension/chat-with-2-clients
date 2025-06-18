@@ -1,0 +1,31 @@
+{
+  "$jsonSchema": {
+    "bsonType": "object",
+    "required": ["participants", "start_time", "status"],
+    "properties": {
+      "participants": {
+        "bsonType": "array",
+        "description": "must be an array of participant usernames",
+        "minItems": 2,
+        "items": {
+          "bsonType": "string",
+          "minLength": 1
+        },
+        "uniqueItems": true
+      },
+      "start_time": {
+        "bsonType": "date",
+        "description": "must be a date and is required"
+      },
+      "end_time": {
+        "bsonType": ["date", "null"],
+        "description": "must be a date or null"
+      },
+      "status": {
+        "enum": ["active", "ended"],
+        "description": "must be 'active' or 'ended'"
+      }
+    },
+    "additionalProperties": true
+  }
+}
