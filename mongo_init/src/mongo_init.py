@@ -5,19 +5,18 @@ from pymongo import MongoClient
 from pymongo.errors import CollectionInvalid, OperationFailure
 import json
 
-from server.src.chat_server import users_collection
 
 MONGO_HOST = os.getenv("MONGO_HOST", "mongo")
 MONGO_PORT = int(os.getenv("MONGO_PORT", "27017"))
-MONGO_ROOT_USERNAME = os.getenv("MONGO_USERNAME")
-MONGO_ROOT_PASSWORD = os.getenv("MONGO_PASSWORD")
+MONGO_ROOT_USERNAME = os.getenv("MONGO_ROOT_USERNAME")
+MONGO_ROOT_PASSWORD = os.getenv("MONGO_ROOT_PASSWORD")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "chat_app_db")
 
 MONGO_APP_USERNAME = os.getenv("MONGO_APP_USERNAME")
 MONGO_APP_PASSWORD = os.getenv("MONGO_APP_PASSWORD")
 
 SCHEMAS_DIR = os.path.join(os.path.dirname(__file__), 'schemas')
-SESSIONS_SCHEMA_FILE = os.path.join(SCHEMAS_DIR, 'sessions.json')
+SESSIONS_SCHEMA_FILE = os.path.join(SCHEMAS_DIR, 'sessions_schema.json')
 USERS_SCHEMA_FILE = os.path.join(SCHEMAS_DIR, 'users_schema.json')
 MESSAGES_SCHEMA_FILE = os.path.join(SCHEMAS_DIR, 'messages_schema.json')
 
@@ -37,7 +36,7 @@ def load_json_schema(file_path):
 
 def apply_schema_validation(db, collection_name, validator):
     try:
-        if collection_name not in db.collection_names():
+        if collection_name not in db.list_collection_names():
             db.create_collection(collection_name, validator=validator)
             print(f"Created '{collection_name}' collection with schema validation.")
         else:
@@ -56,25 +55,26 @@ def apply_schema_validation(db, collection_name, validator):
         print(f"ERROR: Failed to apply schema validation for '{collection_name}': {e}")
         return False
 
-def create_app_user(db):
+def create_app_user(db_to_create_user_in):
     if not MONGO_APP_USERNAME or not MONGO_APP_PASSWORD:
         print("WARNING: MONGO_APP_USERNAME or MONGO_APP_PASSWORD not set. Skipping app user creation.")
         return False
     try:
-        users_in_db = db.command('usersInfo')
+        users_in_db = db_to_create_user_in.command('usersInfo')
         user_exists = any(u['user'] == MONGO_APP_USERNAME for u in users_in_db['users'])
 
         if user_exists:
             print(f"User '{MONGO_APP_USERNAME}' already exists. Skipping creation.")
             return True
         else:
-            db.command({
+            db_to_create_user_in.command({
                 "createUser": MONGO_APP_USERNAME,
                 "pwd": MONGO_APP_PASSWORD,
                 "roles": [
                     { "role": "readWrite", "db": MONGO_DB_NAME }
                 ]
             })
+            print(db_to_create_user_in.command('usersInfo'))
             print(f"Successfully created restricted user '{MONGO_APP_USERNAME}' for database '{MONGO_DB_NAME}'.")
             return True
     except OperationFailure as e:
@@ -91,17 +91,12 @@ def initialize_mongodb_schema():
         if MONGO_ROOT_USERNAME and MONGO_ROOT_PASSWORD:
             client = MongoClient(MONGO_HOST, MONGO_PORT, username=MONGO_ROOT_USERNAME, password=MONGO_ROOT_PASSWORD, authSource='admin', serverSelectionTimeoutMS=5000)
         else:
-            client = MongoClient(MONGO_HOST, MONGO_PORT, serverSelectionTimeoutMS=5000)
+            raise Exception("MONGO_ROOT_USERNAME or MONGO_ROOT_PASSWORD not set.")
 
         client.admin.command('ping')
         print("Sucessfully connected to MongoDB for schema initialization.")
 
         db = client[MONGO_DB_NAME] # implicitly create the db with name MONGO_DB_NAME
-
-        if not create_app_user(db):
-            print("ERROR: App User could not be created. Exiting initialization.")
-            return False
-
         users_validator = load_json_schema(USERS_SCHEMA_FILE)
         sessions_validator = load_json_schema(SESSIONS_SCHEMA_FILE)
         messages_validator = load_json_schema(MESSAGES_SCHEMA_FILE)
@@ -146,6 +141,15 @@ def initialize_mongodb_schema():
         except Exception as e:
             print(f"ERROR: Failed to ensure indexes for 'messages' collection: {e}")
             return False
+
+        print("\n--- Creating Application User ---")
+        if not create_app_user(db):
+            print("ERROR: App User could not be created. Exiting initialization.")
+            return False
+
+        print("\nMongoDB schema initialization and user creation complete.")
+        return True
+
     except Exception as e:
         print(f"ERROR: Failed to connect to MongoDB or initialize schema: {e}")
         return False

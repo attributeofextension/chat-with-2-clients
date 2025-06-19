@@ -21,7 +21,7 @@ services:
       - MONGO_ROOT_USERNAME=${MONGO_INITDB_ROOT_USERNAME}
       - MONGO_ROOT_PASSWORD=${MONGO_INITDB_ROOT_PASSWORD}
       - MONGO_APP_USERNAME=${MONGO_APP_USERNAME}
-      - MONGO_APP_PASSWORD
+      - MONGO_APP_PASSWORD=${MONGO_APP_PASSWORD}
       - MONGO_DB_NAME=${MONGO_DB_NAME}
 
   server:
@@ -34,7 +34,8 @@ services:
     volumes:
       - ./server/src:/app
     depends_on:
-      - mongo_init
+      mongo_init:
+        condition: service_completed_successfully
     environment:
       - MONGO_USERNAME=${MONGO_APP_USERNAME}
       - MONGO_PASSWORD=${MONGO_APP_PASSWORD}
@@ -61,5 +62,16 @@ services:
       - server
     volumes:
       - ./client/src:/app
+
+  client3:
+    build: ./client
+    command: python chat_client.py server 12345
+    stdin_open: true
+    tty: true
+    depends_on:
+      - server
+    volumes:
+      - ./client/src:/app
+
 volumes:
   mongo_data:

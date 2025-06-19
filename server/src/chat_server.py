@@ -4,7 +4,7 @@ import json
 import sys
 import os
 from pymongo import MongoClient
-from datetime import datetime, UTC
+from datetime import datetime, timezone
 import queue
 from bson.objectid import ObjectId
 import bcrypt
@@ -28,7 +28,7 @@ def init_mongodb():
         if MONGO_USERNAME and MONGO_PASSWORD:
             mongo_client = MongoClient(MONGO_HOST, MONGO_PORT, username=MONGO_USERNAME, password=MONGO_PASSWORD, authSource=MONGO_DB_NAME)
         else:
-            mongo_client = MongoClient(MONGO_HOST, MONGO_PORT)
+            raise Exception("MONGO_USERNAME and MONGO_PASSWORD must be set.")
 
         mongo_client.admin.command('ping')
         print(f"Successfully connected to MongoDB at {MONGO_HOST}:{MONGO_PORT} as user '{MONGO_USERNAME}'.")
@@ -55,7 +55,7 @@ def register_user(username, password):
         users_collection.insert_one({
             "username": username,
             "password_hash": hashed_password,
-            "created_at": datetime.now(UTC)
+            "created_at": datetime.now(timezone.utc)
         })
         print(f"User '{username}' registered successfully.")
         return True, "Registration successful."
@@ -78,9 +78,9 @@ def store_message(session_id, sender_username, receiver_usernames, content):
         messages_collection.insert_one({
             "sessionId": session_id,
             "sender": sender_username,
-            "receiver": receiver_usernames,
+            "receivers": receiver_usernames,
             "content": content,
-            "timestamp": datetime.now(UTC)
+            "timestamp": datetime.now(timezone.utc)
         })
         print(f"Message from '{sender_username}' to [{', '.join(receiver_usernames)}] stored.")
         return True
@@ -157,9 +157,9 @@ class AuthenticationHandler(threading.Thread):
                 return
 
             if auth_message.get("type") == "auth_request":
-                action = auth_message.get("action")
-                username = auth_message.get("username")
-                password = auth_message.get("password")
+                action = auth_message.get("content").get("action")
+                username = auth_message.get("content").get("username")
+                password = auth_message.get("content").get("password")
 
                 if action == "register":
                     success, msg = register_user(username, password)
@@ -173,7 +173,7 @@ class AuthenticationHandler(threading.Thread):
                             send_message(self.conn, "auth_response", "Registration successful, but failed to auto-login. Please try logging in.")
                             self.conn.close()
                     else:
-                        send_message(self.conn, "auth_reponse", msg)
+                        send_message(self.conn, "auth_response", msg)
                         print(f"Client {self.addr} registration failed: {msg}")
                         self.conn.close()
                 elif action == "login":
@@ -188,7 +188,7 @@ class AuthenticationHandler(threading.Thread):
                         self.conn.close()
                 else:
                     send_message(self.conn, "auth_response", "Invalid authentication action.")
-                    print(f"Client {self.addr} sent invalid message type for auth: {auth_message.get('type')}")
+                    print(f"Client {self.addr} sent invalid message type for auth: {auth_message.get('type')}, {auth_message.get('content')}")
                     self.conn.close()
             else:
                 send_message(self.conn, "auth_response", "Invalid authentication message type.")
@@ -241,12 +241,13 @@ class ChatSession(threading.Thread):
         for username, client in self.active_clients_index.items():
             send_message(client.conn, "info", f"Welcome to the group chat! Your session ID is {self.session_id}")
             send_message(client.conn, "info", f"Participants: {', '.join(self.participants)}")
+            send_message(client.conn, "data", { "items": [{"key": "session_id", "value": self.session_id.__str__() }]})
 
     def create_db_session(self):
         try:
             result = sessions_collection.insert_one({
                 "participants": self. participants,
-                "start_time": datetime.now(UTC),
+                "start_time": datetime.now(timezone.utc),
                 "status": "active"
             })
             self.session_id = result.inserted_id
@@ -260,31 +261,11 @@ class ChatSession(threading.Thread):
             try:
                 sessions_collection.update_one(
                     {"_id": self.session_id },
-                    {"$set": {"status": status, "end_time": datetime.now(UTC) if status == "ended" else None}}
+                    {"$set": {"status": status, "end_time": datetime.now(timezone.utc) if status == "ended" else None}}
                 )
                 print(f"MongoDB session {self.session_id} updated to {status}.")
             except Exception as e:
                 print(f"ERROR: Failed to update MongoDB session {self.session_id} status: {e}")
-
-
-    def get_receivers_for_sender(self, sender):
-        receivers = []
-        for user in self.users:
-            if user.username == sender.username:
-                continue
-            receivers.append(user)
-        return receivers
-
-    def broadcast_message(self, message_type, content, exclude_sender=False, sender=None):
-        failed_to_send = []
-        with self.session_lock:
-
-            for user in self.users:
-                if exclude_sender and sender is not None and user.username != sender.username:
-                    continue
-                if not send_message(user.conn, "chat", content):
-                    print(f"Failed to broadcast message to client {user.conn.getpeername()}.")
-                    failed_to_send.append(user)
 
     def _client_listener_thread(self, client_conn, client_addr, username):
         print(f"Client listener thread started for {username} ({client_addr}) in session {self.session_id}")
@@ -411,34 +392,8 @@ def start_server(host, port):
                 auth_handler = AuthenticationHandler(conn, addr)
                 auth_handler.start()
 
-                while authenticated_client_queue.qsize() >= 3:
-                    client1 = authenticated_client_queue.get()
-                    client2 = authenticated_client_queue.get()
-                    client3 = authenticated_client_queue.get()
-
-                    # test sockets before spawning chat session
-                    try:
-                        client1.conn.send(b'', 0)
-                        client2.conn.send(b'', 0)
-                        client3.conn.send(b'', 0)
-
-                        chat_session = ChatSession([client1, client2, client3])
-                        chat_session.start()
-                        print(f"Grouped [{', '.join([client1,client2,client3])}]. New chat session started.")
-                    except socket.error as se:
-                        print(f"WARNING: One or more clients ([{', '.join([client1, client2, client3])}]) disconnected before chat session could start: {se}. Discarding group.")
-                        try: client1.conn.close()
-                        except: pass
-                        try: client2.conn.close()
-                        except: pass
-                        try: client3.conn.close()
-                        except: pass
-
             except socket.timeout:
-                if authenticated_client_queue.qsize() >= 3:
-                    continue
-                else:
-                    continue
+                pass
             except socket.error as e:
                 print(f"ERROR: Socket error during server accept loop: {e}")
                 break
@@ -448,6 +403,29 @@ def start_server(host, port):
             except Exception as e:
                 print(f"An unexpected general error occurred in server: {e}")
                 break
+
+            while authenticated_client_queue.qsize() >= 3:
+                client1 = authenticated_client_queue.get()
+                client2 = authenticated_client_queue.get()
+                client3 = authenticated_client_queue.get()
+
+                # test sockets before spawning chat session
+                try:
+                    client1.conn.send(b'', 0)
+                    client2.conn.send(b'', 0)
+                    client3.conn.send(b'', 0)
+
+                    chat_session = ChatSession([client1, client2, client3])
+                    chat_session.start()
+                    print(f"Grouped [{', '.join([client1.__str__(),client2.__str__(),client3.__str__()])}]. New chat session started.")
+                except socket.error as se:
+                    print(f"WARNING: One or more clients ([{', '.join([client1.__str__(), client2.__str__(), client3.__str__()])}]) disconnected before chat session could start: {se}. Discarding group.")
+                    try: client1.conn.close()
+                    except: pass
+                    try: client2.conn.close()
+                    except: pass
+                    try: client3.conn.close()
+                    except: pass
     except socket.error as e:
         print(f"Failed to start server (bind/listen): {e}")
     finally:
@@ -455,7 +433,7 @@ def start_server(host, port):
         print("Server socket closed.")
         if mongo_client:
             mongo_client.close()
-            print("MongoDB connection closed.")
+            print("MongoDB client closed.")
 
 
 
