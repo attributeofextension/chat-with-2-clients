@@ -9,6 +9,9 @@ services:
       - MONGO_INITDB_ROOT_USERNAME=${MONGO_INITDB_ROOT_USERNAME}
       - MONGO_INITDB_ROOT_PASSWORD=${MONGO_INITDB_ROOT_PASSWORD}
     restart: unless-stopped
+    networks:
+      chat_network:
+        ipv4_address: ${MONGO_IP_ADDRESS}
 
   mongo_init:
     build: ./mongo_init
@@ -16,23 +19,29 @@ services:
     depends_on:
       - mongo
     environment:
-      - MONGO_HOST=mongo
+      - MONGO_HOST=${MONGO_IP_ADDRESS}
       - MONGO_PORT=27017
       - MONGO_ROOT_USERNAME=${MONGO_INITDB_ROOT_USERNAME}
       - MONGO_ROOT_PASSWORD=${MONGO_INITDB_ROOT_PASSWORD}
       - MONGO_APP_USERNAME=${MONGO_APP_USERNAME}
       - MONGO_APP_PASSWORD=${MONGO_APP_PASSWORD}
       - MONGO_DB_NAME=${MONGO_DB_NAME}
+      - CHAT_APP_ENV=${CHAT_APP_ENV}
+    networks:
+      chat_network:
 
   server:
-    build: ./server
+    build:
+      context: .
+      dockerfile: ./server/Dockerfile
     ports:
       - "12345:12345"
-    command: python chat_server.py 0.0.0.0 12345
+    command: python /app/chat_server.py ${SERVER_IP_ADDRESS} 12345
     stdin_open: true
     tty: true
     volumes:
       - ./server/src:/app
+      - ./certs:/app/certs:ro
     depends_on:
       mongo_init:
         condition: service_completed_successfully
@@ -42,36 +51,39 @@ services:
       - MONGO_HOST=mongo
       - MONGO_PORT=27017
       - MONGO_DB_NAME=${MONGO_DB_NAME}
+      - CHAT_APP_ENV=${CHAT_APP_ENV}
+    networks:
+      chat_network:
+        ipv4_address: ${SERVER_IP_ADDRESS}
+        aliases:
+          - ${SERVER_DOMAIN_NAME}
 
-  client1:
-    build: ./client
-    command: python chat_client.py server 12345
+
+  client:
+    build:
+      context: .
+      dockerfile: ./client/Dockerfile
+    command: python chat_client.py ${SERVER_DOMAIN_NAME} 12345
     stdin_open: true
     tty: true
     depends_on:
       - server
     volumes:
       - ./client/src:/app
-
-  client2:
-    build: ./client
-    command: python chat_client.py server 12345
-    stdin_open: true
-    tty: true
-    depends_on:
-      - server
-    volumes:
-      - ./client/src:/app
-
-  client3:
-    build: ./client
-    command: python chat_client.py server 12345
-    stdin_open: true
-    tty: true
-    depends_on:
-      - server
-    volumes:
-      - ./client/src:/app
+      - ./certs:/app/certs:ro
+    environment:
+      - CHAT_APP_ENV=${CHAT_APP_ENV}
+      - CHAT_SSL_DEBUG_UNSAFE=${CHAT_SSL_DEBUG_UNSAFE}
+    networks:
+      chat_network:
 
 volumes:
   mongo_data:
+
+networks:
+  chat_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+          gateway: 172.20.0.1
